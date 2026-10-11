@@ -12,6 +12,11 @@ import type { IConstruct } from 'constructs';
  *
  * Changing a physical name makes CloudFormation REPLACE the resource, so apply
  * this to a fresh backend or accept that the data in the old resources is lost.
+ *
+ * Not renamed, because Amplify cannot do it safely:
+ *  - DynamoDB tables (the table manager never renames an existing table, so a new name would
+ *    leave AppSync pointing at a table that does not exist), e.g. `Todo-<apiId>-NONE`
+ *  - Custom resource provider lambdas (see KEEP_GENERATED_NAMES)
  */
 
 /** Name of this project; the first part of every resource name. */
@@ -35,7 +40,6 @@ const LABELS: [RegExp, string][] = [
   [/AmplifyBranchLinker\/CustomResourceLambda\/ServiceRole\//, 'branch-linker-role'],
   [/AmplifyBranchLinker\/CustomResourceLambda\//, 'branch-linker'],
   [/AmplifyBranchLinker\/CustomResourceProvider\/framework-onEvent\/ServiceRole\//, 'branch-linker-provider-role'],
-  [/AmplifyBranchLinker\/CustomResourceProvider\/framework-onEvent\//, 'branch-linker-provider'],
 
   // Auth
   [/^auth\/amplifyAuth\/UserPool\//, 'user-pool'],
@@ -47,10 +51,8 @@ const LABELS: [RegExp, string][] = [
   // Data
   [/amplifyData\/GraphQLAPI\//, 'api'],
   [/amplifyData\/([^/]+)\/\1IAMRole\//, '$1-table-role'],
-  [/amplifyData\/([^/]+)\/\1Table\//, '$1'],
   [/AmplifyTableManager\/AmplifyManagedTableOnEventRole\//, 'table-manager-on-event-role'],
   [/AmplifyTableManager\/AmplifyManagedTableIsCompleteRole\//, 'table-manager-is-complete-role'],
-  [/AmplifyTableManager\/TableManagerCustomProvider\/framework-onEvent\//, 'table-manager-on-event'],
   [/AmplifyTableManager\/TableManagerCustomProvider\/framework-isComplete\//, 'table-manager-is-complete'],
   [/AmplifyTableManager\/AmplifyTableWaiterStateMachine\/Role\//, 'table-waiter-role'],
   [/AmplifyTableManager\/AmplifyTableWaiterStateMachine\//, 'table-waiter'],
@@ -61,9 +63,7 @@ const LABELS: [RegExp, string][] = [
 
   // CDK helper functions; every stack (data, storage, ...) gets its own copy, so $stack keeps them apart
   [/Custom::S3AutoDeleteObjectsCustomResourceProvider\/Role\//, '$stack-s3-auto-delete-role'],
-  [/Custom::S3AutoDeleteObjectsCustomResourceProvider\/Handler\//, '$stack-s3-auto-delete'],
   [/Custom::CDKBucketDeployment[^/]*\/ServiceRole\//, '$stack-bucket-deployment-role'],
-  [/Custom::CDKBucketDeployment[^/]*\//, '$stack-bucket-deployment'],
 ];
 
 /** CloudFormation type -> template property holding the physical name, and the max length AWS allows. */
@@ -77,8 +77,19 @@ const NAME_PROPERTIES: Record<string, { property: string; maxLength: number; acc
   'AWS::Cognito::IdentityPool': { property: 'IdentityPoolName', maxLength: 128 },
   'AWS::AppSync::GraphQLApi': { property: 'Name', maxLength: 65 },
   'AWS::StepFunctions::StateMachine': { property: 'StateMachineName', maxLength: 80 },
-  'Custom::AmplifyDynamoDBTable': { property: 'tableName', maxLength: 255 },
 };
+
+/**
+ * Lambdas that act as the `ServiceToken` of a CloudFormation custom resource. Renaming one changes
+ * the custom resource's ServiceToken, which CloudFormation rejects ("Modifying service token is not
+ * allowed") and rolls the whole deploy back, so they keep their generated names.
+ */
+const KEEP_GENERATED_NAMES: RegExp[] = [
+  /AmplifyBranchLinker\/CustomResourceProvider\/framework-onEvent\//,
+  /AmplifyTableManager\/TableManagerCustomProvider\/framework-onEvent\//,
+  /Custom::S3AutoDeleteObjectsCustomResourceProvider\/Handler\//,
+  /Custom::CDKBucketDeployment[^/]*\/Resource\//,
+];
 
 /** Characters in an AWS account id, used to budget the length of account-suffixed names. */
 const ACCOUNT_ID_LENGTH = 12;
@@ -141,6 +152,10 @@ class ReadableNames implements IAspect {
     if (!target) return;
 
     const path = node.node.path.split('/').slice(1).join('/'); // drop the root stack id
+    if (node.cfnResourceType === 'AWS::Lambda::Function' && KEEP_GENERATED_NAMES.some((rule) => rule.test(`${path}/`))) {
+      return;
+    }
+
     const label = labelFor(path, node.cfnResourceType);
     const budget = target.maxLength - (target.accountSuffix ? ACCOUNT_ID_LENGTH + 1 : 0);
     const name = fit(this.prefix, label, budget);
